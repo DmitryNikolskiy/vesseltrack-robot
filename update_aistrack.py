@@ -190,6 +190,40 @@ def load_points(text):
     return pts, line_props
 
 
+PATCH_FILE = "vf_patch.json"
+
+
+def load_patch(text):
+    """vf_patch.json от задачи VesselFinder: {"points": [[ts, lon, lat, sog, cog], ...]}."""
+    if not text or not text.strip():
+        return []
+    out = []
+    for r in json.loads(text).get("points", []):
+        try:
+            out.append({"ts": int(r[0]), "lon": round(float(r[1]), 5), "lat": round(float(r[2]), 5),
+                        "sog": r[3] if len(r) > 3 else None, "cog": r[4] if len(r) > 4 else None,
+                        "src": "vesselfinder"})
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def fill_gaps(existing, patch, tolerance=120):
+    """Добавляет точки VesselFinder, которых нет в треке (нет точки ближе tolerance секунд)."""
+    if not patch:
+        return existing, 0
+    ts_sorted = sorted(p["ts"] for p in existing)
+    import bisect
+    added = []
+    for p in patch:
+        i = bisect.bisect_left(ts_sorted, p["ts"])
+        near = [ts_sorted[j] for j in (i - 1, i) if 0 <= j < len(ts_sorted)]
+        if any(abs(t - p["ts"]) <= tolerance for t in near):
+            continue
+        added.append(p)
+    return existing + added, len(added)
+
+
 def merge(existing, new, cfg, now_ts):
     """Объединяет точки, отбрасывает дубли и точки вне периода, прореживает новые по min_interval."""
     lo = cfg["from"] if cfg["from"] is not None else -1
@@ -352,7 +386,8 @@ def run_online():
                       and f["mimeType"] == "application/vnd.google-apps.folder"), None)
     if not gj_folder:
         raise RuntimeError("В папке VesselTrack нет подпапки geojson")
-    track = next((f for f in drive.list(gj_folder["id"]) if f["name"].lower() == TRACK_FILE), None)
+    gj_files = drive.list(gj_folder["id"])
+    track = next((f for f in gj_files if f["name"].lower() == TRACK_FILE), None)
 
     seconds = int(os.environ.get("LISTEN_SECONDS", "240"))
     positions, static = asyncio.run(listen(os.environ["AISSTREAM_API_KEY"], cfg["mmsi"], seconds))
@@ -361,8 +396,22 @@ def run_online():
 
     old_text = drive.download(track["id"]) if track else ""
     existing, props = load_points(old_text)
+    # дозаполнение пропусков точками VesselFinder (их выкладывает задача с компьютера)
+    patch = [f for f in gj_files if f["name"].lower() == PATCH_FILE]
+    if patch:
+        newest = max(patch, key=lambda f: f.get("modifiedTime") or "")
+        try:
+            existing, filled = fill_gaps(existing, load_patch(drive.download(newest["id"])))
+            if filled:
+                log(f"Дозаполнено из VesselFinder: {filled} точек")
+        except Exception as e:  # повреждённый патч не должен ломать обновление
+            warn(f"vf_patch.json не прочитан: {e}")
+            filled = 0
+    else:
+        filled = 0
     points, added = merge(existing, positions, cfg, now_ts)
-    dropped = len(existing) - (len(points) - added)
+    added += filled
+    dropped = len(existing) - (len(points) - (added - filled))
     if added == 0 and dropped == 0 and track:
         last = existing[-1]["ts"] if existing else None
         log("Новых точек нет" + (f"; последняя точка {iso(last)}" if last else ""))
