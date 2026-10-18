@@ -342,6 +342,11 @@ class Drive:
                                  data=text.encode("utf-8"), headers={"Content-Type": "application/geo+json"}),
                     "запись файла")
 
+    def set_description(self, file_id, text):
+        """Отметка о проверке в описании файла — видна в приложении и в свойствах файла в Drive."""
+        self._check(self.s.patch(f"{self.API}/{file_id}", params={"supportsAllDrives": "true", "fields": "id"},
+                                 json={"description": text}), "отметка о проверке")
+
     def create(self, folder_id, name, text):
         boundary = "vesseltrack-boundary"
         meta = json.dumps({"name": name, "parents": [folder_id], "mimeType": "application/geo+json"})
@@ -371,6 +376,15 @@ def load_config(drive, folder):
     if not cfg_file:
         raise RuntimeError("В папке VesselTrack нет config.json")
     return root, read_config(drive.download(cfg_file["id"]))
+
+
+def heartbeat(drive, track_id, heard, points_total, last_ts):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    last = iso(last_ts) if last_ts else "—"
+    try:
+        drive.set_description(track_id, f"robot {now} heard={heard} points={points_total} last={last}")
+    except Exception as e:
+        warn(f"Отметка о проверке не записана: {e}")
 
 
 def sync(drive, folder, positions, static):
@@ -409,12 +423,14 @@ def sync(drive, folder, positions, static):
     added += filled
     dropped = len(existing) - (len(points) - (added - filled))
     if added == 0 and dropped == 0 and track:
-        last = existing[-1]["ts"] if existing else None
+        last = max((p["ts"] for p in existing), default=None)
         log("Новых точек нет" + (f"; последняя точка {iso(last)}" if last else ""))
+        heartbeat(drive, track["id"], len(positions), len(existing), last)
         return cfg
     text = build_geojson(points, cfg, props, now_ts)
     if track:
         drive.update(track["id"], text)
+        heartbeat(drive, track["id"], len(positions), len(points), points[-1]["ts"] if points else None)
     else:
         drive.create(gj_folder["id"], TRACK_FILE, text)
     log(f"Записано: +{added} точек, удалено вне периода {dropped}, всего {len(points)}")
@@ -473,6 +489,65 @@ def run_online():
             warn(f"Последняя запись не удалась: {e}")
 
 
+async def probe(api_key, boxes, mmsi_filter, seconds):
+    """Диагностика: сколько сообщений и судов aisstream отдаёт в заданном районе."""
+    import websockets
+    sub = {"APIKey": api_key, "BoundingBoxes": boxes, "FilterMessageTypes": POSITION_TYPES}
+    if mmsi_filter:
+        sub["FiltersShipMMSI"] = mmsi_filter
+    msgs, ships, near = 0, {}, []
+    loop = asyncio.get_running_loop()
+    end = loop.time() + seconds
+    async with websockets.connect("wss://stream.aisstream.io/v0/stream", open_timeout=30) as ws:
+        await ws.send(json.dumps(sub))
+        while loop.time() < end:
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=end - loop.time())
+            except asyncio.TimeoutError:
+                break
+            m = json.loads(raw)
+            if "error" in m:
+                raise RuntimeError(f"aisstream: {m['error']}")
+            msgs += 1
+            md = m.get("MetaData") or {}
+            ships[str(md.get("MMSI"))] = (str(md.get("ShipName") or "").strip(), float(md.get("latitude") or 0),
+                                          float(md.get("longitude") or 0), str(md.get("time_utc") or "")[:19])
+    return msgs, ships
+
+
+def run_diagnose():
+    """Проверка покрытия aisstream вокруг последней известной точки судна."""
+    folder = normalize_folder_id(os.environ["DRIVE_FOLDER_ID"])
+    drive = Drive(os.environ["GOOGLE_SA_JSON"])
+    key = os.environ["AISSTREAM_API_KEY"]
+    root, cfg = load_config(drive, folder)
+    gj = next(f for f in root if f["name"].lower() == GEOJSON_FOLDER)
+    track = next(f for f in drive.list(gj["id"]) if f["name"].lower() == TRACK_FILE)
+    pts, _ = load_points(drive.download(track["id"]))
+    last = max(pts, key=lambda p: p["ts"])
+    lat, lon = last["lat"], last["lon"]
+    log(f"Последняя точка судна: {lat:.3f}, {lon:.3f} ({iso(last['ts'])}, источник {last.get('src') or 'vesselfinder'})")
+
+    box = [[[lat - 1.5, lon - 2.0], [lat + 1.5, lon + 2.0]]]
+    msgs, ships = asyncio.run(probe(key, box, None, 120))
+    log(f"1) Район ±1.5° вокруг судна, 2 мин, все суда: сообщений {msgs}, судов {len(ships)}")
+    for mm, (name, la, lo, t) in list(ships.items())[:15]:
+        log(f"     {mm} {name or '—'} {la:.3f},{lo:.3f} {t}")
+    log(f"   Наше судно {cfg['mmsi']} в районе: {'ДА' if cfg['mmsi'] in ships else 'нет'}")
+
+    msgs2, ships2 = asyncio.run(probe(key, [[[-90, -180], [90, 180]]], [cfg["mmsi"]], 120))
+    log(f"2) Весь мир, фильтр по MMSI {cfg['mmsi']}, 2 мин: сообщений {msgs2}")
+    for mm, (name, la, lo, t) in ships2.items():
+        log(f"     {mm} {name or '—'} {la:.3f},{lo:.3f} {t}")
+
+    if msgs == 0:
+        log("ВЫВОД: aisstream вообще не принимает суда в этом районе — нет береговых станций.")
+    elif cfg["mmsi"] not in ships and msgs2 == 0:
+        log("ВЫВОД: станции в районе есть, но наше судно они не слышат (далеко от берега или слабый передатчик).")
+    else:
+        log("ВЫВОД: aisstream видит наше судно — подписка работает.")
+
+
 def run_offline(cfg_path, track_path, messages_path):
     now_ts = int(datetime.now(timezone.utc).timestamp())
     cfg = read_config(open(cfg_path, encoding="utf-8").read())
@@ -491,6 +566,8 @@ if __name__ == "__main__":
     try:
         if len(sys.argv) == 5 and sys.argv[1] == "--offline":
             run_offline(*sys.argv[2:])
+        elif os.environ.get("MODE") == "diagnose":
+            run_diagnose()
         else:
             run_online()
     except Exception as e:  # понятное сообщение в журнале Actions
