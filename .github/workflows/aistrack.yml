@@ -2,7 +2,7 @@ name: aistrack
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "17 * * * *"    # раз в час; каждый запуск работает ~5,5 ч, следующий ждёт в очереди
   workflow_dispatch:
 
 concurrency:
@@ -12,7 +12,7 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,10 +21,11 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
       - run: pip install -r requirements.txt
-      - name: Обновить aistrack.geojson
+      - name: Слушать АИС и обновлять aistrack.geojson
         env:
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
-          LISTEN_SECONDS: "240"
+          RUN_MINUTES: "330"
+          CYCLE_SECONDS: "300"
         run: python update_aistrack.py
