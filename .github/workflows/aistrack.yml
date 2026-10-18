@@ -33,6 +33,6 @@ jobs:
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
           RUN_MINUTES: "330"
-          CYCLE_SECONDS: "300"
+          CYCLE_SECONDS: "60"
           MODE: ${{ inputs.mode || 'normal' }}
         run: python update_aistrack.py
