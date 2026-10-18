@@ -106,16 +106,43 @@ def parse_ais_time(s):
     return int(datetime.fromisoformat(f"{m.group(1)}T{m.group(2)}+00:00").timestamp())
 
 
-def extract_position(msg):
-    """Сообщение aisstream -> (ts, lon, lat, sog, cog, heading, nav_status) или None."""
+def _meta(msg):
+    for k in ("MetaData", "Metadata", "metadata", "metaData"):
+        if isinstance(msg.get(k), dict):
+            return msg[k]
+    return {}
+
+
+def _body(msg):
+    """Тело сообщения о позиции: по MessageType или по первому известному ключу внутри Message."""
+    m = msg.get("Message") or {}
     t = msg.get("MessageType")
-    if t not in POSITION_TYPES:
+    if t in POSITION_TYPES and isinstance(m.get(t), dict):
+        return m[t]
+    for k in POSITION_TYPES:
+        if isinstance(m.get(k), dict):
+            return m[k]
+    return None
+
+
+def msg_mmsi(msg):
+    meta = _meta(msg)
+    v = meta.get("MMSI") or meta.get("mmsi")
+    if not v:
+        b = _body(msg) or {}
+        v = b.get("UserID")
+    return str(v) if v else None
+
+
+def extract_position(msg, received_ts=None):
+    """Сообщение aisstream -> позиция или None. Время — из MetaData.time_utc, иначе время приёма."""
+    body = _body(msg)
+    if body is None:
         return None
-    body = (msg.get("Message") or {}).get(t) or {}
-    meta = msg.get("MetaData") or {}
+    meta = _meta(msg)
     lat = body.get("Latitude", meta.get("latitude"))
     lon = body.get("Longitude", meta.get("longitude"))
-    ts = parse_ais_time(meta.get("time_utc"))
+    ts = parse_ais_time(meta.get("time_utc")) or received_ts
     if lat is None or lon is None or ts is None:
         return None
     if not (-90 <= lat <= 90 and -180 <= lon <= 180) or (lat == 0 and lon == 0):
@@ -138,6 +165,7 @@ async def listen(api_key, mmsi, seconds):
     import websockets  # pip install websockets
 
     positions, static = [], []
+    unknown = 0
     sub = {
         "APIKey": api_key,
         "BoundingBoxes": [[[-90, -180], [90, 180]]],
@@ -162,9 +190,12 @@ async def listen(api_key, mmsi, seconds):
             if msg.get("MessageType") == "ShipStaticData":
                 static.append(msg["Message"]["ShipStaticData"])
                 continue
-            p = extract_position(msg)
+            p = extract_position(msg, int(datetime.now(timezone.utc).timestamp()))
             if p:
                 positions.append(p)
+            elif unknown < 3:
+                unknown += 1
+                warn(f"Сообщение не разобрано: {raw[:400]}")
     return positions, static
 
 
@@ -509,9 +540,13 @@ async def probe(api_key, boxes, mmsi_filter, seconds):
             if "error" in m:
                 raise RuntimeError(f"aisstream: {m['error']}")
             msgs += 1
-            md = m.get("MetaData") or {}
-            ships[str(md.get("MMSI"))] = (str(md.get("ShipName") or "").strip(), float(md.get("latitude") or 0),
-                                          float(md.get("longitude") or 0), str(md.get("time_utc") or "")[:19])
+            md = _meta(m)
+            mm = msg_mmsi(m)
+            if not mm or not md:
+                log(f"     [необычное сообщение] {raw[:500]}")
+            pos = extract_position(m) or {}
+            ships[mm or "?"] = (str(md.get("ShipName") or "").strip(), float(pos.get("lat") or md.get("latitude") or 0),
+                                float(pos.get("lon") or md.get("longitude") or 0), str(md.get("time_utc") or "")[:19])
     return msgs, ships
 
 
@@ -540,10 +575,11 @@ def run_diagnose():
     for mm, (name, la, lo, t) in ships2.items():
         log(f"     {mm} {name or '—'} {la:.3f},{lo:.3f} {t}")
 
+    seen = cfg["mmsi"] in ships or cfg["mmsi"] in ships2
     if msgs == 0:
         log("ВЫВОД: aisstream вообще не принимает суда в этом районе — нет береговых станций.")
-    elif cfg["mmsi"] not in ships and msgs2 == 0:
-        log("ВЫВОД: станции в районе есть, но наше судно они не слышат (далеко от берега или слабый передатчик).")
+    elif not seen:
+        log("ВЫВОД: станции в районе есть, но наше судно за эти минуты не услышано.")
     else:
         log("ВЫВОД: aisstream видит наше судно — подписка работает.")
 
