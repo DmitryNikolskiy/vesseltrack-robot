@@ -11,6 +11,10 @@ on:
         options: [normal, diagnose]
         default: normal
 
+# запись tail.json в ветку live этого репозитория
+permissions:
+  contents: write
+
 concurrency:
   group: aistrack-${{ inputs.mode || 'normal' }}
   cancel-in-progress: false
@@ -34,5 +38,7 @@ jobs:
           AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
           RUN_MINUTES: "330"
           CYCLE_SECONDS: "60"
+          PUBLISH_TAIL: "1"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MODE: ${{ inputs.mode || 'normal' }}
         run: python update_aistrack.py
