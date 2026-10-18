@@ -4,9 +4,15 @@ on:
   schedule:
     - cron: "17 * * * *"    # раз в час; каждый запуск работает ~5,5 ч, следующий ждёт в очереди
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "normal — обычная работа; diagnose — проверка покрытия aisstream (4 мин)"
+        type: choice
+        options: [normal, diagnose]
+        default: normal
 
 concurrency:
-  group: aistrack
+  group: aistrack-${{ inputs.mode || 'normal' }}
   cancel-in-progress: false
 
 jobs:
@@ -28,4 +34,5 @@ jobs:
           AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
           RUN_MINUTES: "330"
           CYCLE_SECONDS: "300"
+          MODE: ${{ inputs.mode || 'normal' }}
         run: python update_aistrack.py
