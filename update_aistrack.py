@@ -13,7 +13,8 @@
   GOOGLE_SA_JSON     — содержимое JSON-ключа сервисного аккаунта Google
   DRIVE_FOLDER_ID    — ID (или ссылка) папки VesselTrack
   AISSTREAM_API_KEY  — ключ aisstream.io
-  LISTEN_SECONDS     — сколько слушать поток (по умолчанию 240)
+  RUN_MINUTES        — длительность одного запуска, минуты (по умолчанию 330)
+  CYCLE_SECONDS      — как часто записывать накопленное в Drive (по умолчанию 300)
 
 Локальная проверка без сети:
   python update_aistrack.py --offline config.json aistrack.geojson messages.jsonl
@@ -362,25 +363,26 @@ def normalize_folder_id(s):
 
 # ---------------------------------------------------------------- запуск
 
-def run_online():
-    folder = normalize_folder_id(os.environ["DRIVE_FOLDER_ID"])
-    drive = Drive(os.environ["GOOGLE_SA_JSON"])
-    now_ts = int(datetime.now(timezone.utc).timestamp())
-
+def load_config(drive, folder):
     root = drive.list(folder)
     if not root:
         raise RuntimeError(f"Папка пуста или недоступна. Откройте доступ «Редактор» для {drive.email}")
     cfg_file = next((f for f in root if f["name"].lower() == CONFIG_FILE), None)
     if not cfg_file:
         raise RuntimeError("В папке VesselTrack нет config.json")
-    cfg = read_config(drive.download(cfg_file["id"]))
-    log(f"Судно {cfg['name']}, MMSI {cfg['mmsi']}, IMO {cfg['imo']}, "
-        f"период {iso(cfg['from']) if cfg['from'] else '…'} — {iso(cfg['to']) if cfg['to'] else '…'}")
+    return root, read_config(drive.download(cfg_file["id"]))
 
+
+def sync(drive, folder, positions, static):
+    """Перечитывает config.json, сливает накопленные позиции и vf_patch.json в aistrack.geojson.
+    Возвращает cfg или None, если сейчас вне периода наблюдения."""
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    root, cfg = load_config(drive, folder)
     ok, why = in_window(cfg, now_ts)
     if not ok:
         log(f"Пропуск: {why}")
-        return
+        return None
+    check_imo(static, cfg)
 
     gj_folder = next((f for f in root if f["name"].lower() == GEOJSON_FOLDER
                       and f["mimeType"] == "application/vnd.google-apps.folder"), None)
@@ -389,14 +391,10 @@ def run_online():
     gj_files = drive.list(gj_folder["id"])
     track = next((f for f in gj_files if f["name"].lower() == TRACK_FILE), None)
 
-    seconds = int(os.environ.get("LISTEN_SECONDS", "240"))
-    positions, static = asyncio.run(listen(os.environ["AISSTREAM_API_KEY"], cfg["mmsi"], seconds))
-    log(f"Получено позиций АИС: {len(positions)}, статических сообщений: {len(static)}")
-    check_imo(static, cfg)
-
     old_text = drive.download(track["id"]) if track else ""
     existing, props = load_points(old_text)
     # дозаполнение пропусков точками VesselFinder (их выкладывает задача с компьютера)
+    filled = 0
     patch = [f for f in gj_files if f["name"].lower() == PATCH_FILE]
     if patch:
         newest = max(patch, key=lambda f: f.get("modifiedTime") or "")
@@ -407,21 +405,72 @@ def run_online():
         except Exception as e:  # повреждённый патч не должен ломать обновление
             warn(f"vf_patch.json не прочитан: {e}")
             filled = 0
-    else:
-        filled = 0
     points, added = merge(existing, positions, cfg, now_ts)
     added += filled
     dropped = len(existing) - (len(points) - (added - filled))
     if added == 0 and dropped == 0 and track:
         last = existing[-1]["ts"] if existing else None
         log("Новых точек нет" + (f"; последняя точка {iso(last)}" if last else ""))
-        return
+        return cfg
     text = build_geojson(points, cfg, props, now_ts)
     if track:
         drive.update(track["id"], text)
     else:
         drive.create(gj_folder["id"], TRACK_FILE, text)
     log(f"Записано: +{added} точек, удалено вне периода {dropped}, всего {len(points)}")
+    return cfg
+
+
+def run_online():
+    """
+    Долгий запуск: слушает поток АИС непрерывно до RUN_MINUTES минут (по умолчанию 330 — почти
+    6-часовой предел GitHub) и каждые CYCLE_SECONDS секунд записывает накопленное в Drive.
+    Расписание GitHub ненадёжно (запуски «раз в 5 минут» на деле идут раз в 1–2 часа),
+    поэтому один запуск покрывает несколько часов, а следующий встаёт в очередь и продолжает.
+    """
+    import time
+    folder = normalize_folder_id(os.environ["DRIVE_FOLDER_ID"])
+    drive = Drive(os.environ["GOOGLE_SA_JSON"])
+    api_key = os.environ["AISSTREAM_API_KEY"]
+    run_seconds = int(float(os.environ.get("RUN_MINUTES", "330")) * 60)
+    cycle = int(os.environ.get("CYCLE_SECONDS", "300"))
+    deadline = time.monotonic() + run_seconds
+
+    _, cfg = load_config(drive, folder)
+    log(f"Судно {cfg['name']}, MMSI {cfg['mmsi']}, IMO {cfg['imo']}, "
+        f"период {iso(cfg['from']) if cfg['from'] else '…'} — {iso(cfg['to']) if cfg['to'] else '…'}; "
+        f"работаю до {run_seconds // 60} мин, запись каждые {cycle // 60} мин")
+    ok, why = in_window(cfg, int(datetime.now(timezone.utc).timestamp()))
+    if not ok:
+        log(f"Пропуск: {why}")
+        return
+
+    pending, static = [], []
+    while True:
+        left = deadline - time.monotonic()
+        if left < 60:
+            break
+        try:
+            got, st = asyncio.run(listen(api_key, cfg["mmsi"], min(cycle, left - 30)))
+            pending += got
+            static += st
+            log(f"Позиций АИС за цикл: {len(got)}")
+        except Exception as e:  # обрыв соединения — переподключимся в следующем цикле
+            warn(f"aisstream: {e}")
+            time.sleep(20)
+        try:
+            new_cfg = sync(drive, folder, pending, static)
+            pending, static = [], []
+            if new_cfg is None:
+                break
+            cfg = new_cfg
+        except Exception as e:  # сбой Drive не должен останавливать прослушивание; точки сохранятся до следующей записи
+            warn(f"Запись в Drive не удалась, повторю через цикл: {e}")
+    if pending:
+        try:
+            sync(drive, folder, pending, static)
+        except Exception as e:
+            warn(f"Последняя запись не удалась: {e}")
 
 
 def run_offline(cfg_path, track_path, messages_path):
