@@ -15,6 +15,10 @@
   AISSTREAM_API_KEY  — ключ aisstream.io
   RUN_MINUTES        — длительность одного запуска, минуты (по умолчанию 330)
   CYCLE_SECONDS      — как часто записывать накопленное в Drive (по умолчанию 300)
+  PUBLISH_TAIL       — 1: выкладывать последние 72 ч трека в ветку live этого репозитория
+                       (файл tail.json); приложение читает его, потому что Google отдаёт
+                       публичный aistrack.geojson читателям без входа с задержкой до часа
+  GITHUB_TOKEN, GITHUB_REPOSITORY — задаёт GitHub Actions (нужно для PUBLISH_TAIL)
 
 Локальная проверка без сети:
   python update_aistrack.py --offline config.json aistrack.geojson messages.jsonl
@@ -409,6 +413,51 @@ def load_config(drive, folder):
     return root, read_config(drive.download(cfg_file["id"]))
 
 
+TAIL_HOURS = 72
+_last_tail = None
+
+
+def publish_tail(points):
+    """
+    Кладёт последние TAIL_HOURS часов трека в ветку live репозитория (один коммит, без истории):
+    tail.json = {"updated": …, "points": [[ts, lon, lat, sog, cog], …]} — тот же формат, что vf_patch.json.
+    Приложение берёт его с raw.githubusercontent.com (кэш ≤ 5 мин) и добавляет к треку из Drive.
+    """
+    global _last_tail
+    if os.environ.get("PUBLISH_TAIL") != "1" or not points:
+        return
+    token, repo = os.environ.get("GITHUB_TOKEN"), os.environ.get("GITHUB_REPOSITORY")
+    if not token or not repo:
+        warn("PUBLISH_TAIL: нет GITHUB_TOKEN/GITHUB_REPOSITORY")
+        return
+    last = max(p["ts"] for p in points)
+    rows = [[p["ts"], p["lon"], p["lat"], p.get("sog"), p.get("cog")]
+            for p in sorted(points, key=lambda p: p["ts"]) if p["ts"] >= last - TAIL_HOURS * 3600]
+    if rows == _last_tail:
+        return
+    import subprocess
+    import tempfile
+    body = json.dumps({"updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                       "last": iso(last), "points": rows}, separators=(",", ":"))
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "tail.json"), "w") as f:
+            f.write(body)
+
+        def git(*a):
+            subprocess.run(["git", *a], cwd=d, check=True, capture_output=True, timeout=60)
+        try:
+            git("init", "-q")
+            git("config", "user.name", "vesseltrack-robot")
+            git("config", "user.email", "robot@users.noreply.github.com")
+            git("add", "tail.json")
+            git("commit", "-q", "-m", f"tail {iso(last)}")
+            git("push", "-q", "-f", f"https://x-access-token:{token}@github.com/{repo}.git", "HEAD:refs/heads/live")
+            _last_tail = rows
+            log(f"tail.json опубликован: {len(rows)} точек, последняя {iso(last)}")
+        except Exception as e:  # GitHub недоступен — не страшно, Drive обновлён
+            warn(f"tail.json не опубликован: {getattr(e, 'stderr', b'') or e}")
+
+
 def heartbeat(drive, track_id, heard, points_total, last_ts):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     last = iso(last_ts) if last_ts else "—"
@@ -457,6 +506,7 @@ def sync(drive, folder, positions, static):
         last = max((p["ts"] for p in existing), default=None)
         log("Новых точек нет" + (f"; последняя точка {iso(last)}" if last else ""))
         heartbeat(drive, track["id"], len(positions), len(existing), last)
+        publish_tail(existing)  # первый цикл запуска — выложить, если ещё не выложен
         return cfg
     text = build_geojson(points, cfg, props, now_ts)
     if track:
@@ -465,6 +515,7 @@ def sync(drive, folder, positions, static):
     else:
         drive.create(gj_folder["id"], TRACK_FILE, text)
     log(f"Записано: +{added} точек, удалено вне периода {dropped}, всего {len(points)}")
+    publish_tail(points)
     return cfg
 
 
